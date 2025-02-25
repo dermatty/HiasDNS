@@ -1,6 +1,6 @@
 #! /usr/bin/python
 import threading
-import time
+import time, sys
 import dns.message
 import dns.query
 import dns.rdatatype
@@ -66,7 +66,15 @@ class DNSQueryThread(Thread):
             except (Exception, ):
                 continue
 
-
+def handle_query(data, addr, sock):
+    UPSTREAM_DNS_SERVER = ('1.1.1.1', 53)
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as upstream_sock:
+        request = DNSRecord.parse(data)
+        print(
+            "Forwarding query for " + str(request.q.qname) + " to upstream server" + str(UPSTREAM_DNS_SERVER) + " ...")
+        upstream_sock.sendto(data, UPSTREAM_DNS_SERVER)
+        response, _ = upstream_sock.recvfrom(512)
+        sock.sendto(response, addr)
 
 class DNSHandler(socketserver.BaseRequestHandler):
         
@@ -75,10 +83,23 @@ class DNSHandler(socketserver.BaseRequestHandler):
         global DNSQUERYTHREADS
         print("-" * 70)
         data = self.request[0].strip()
-        socket = self.request[1]
-        try:
+        socket0 = self.request[1]
+        #data, addr = sock.recvfrom(512)
+        #dns_handler(data, addr, sock)
+        UPSTREAM_DNS_SERVER = ('8.8.8.8', 53)
+
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as upstream_sock:
             request = DNSRecord.parse(data)
-            print("Received request for: " + str(request.q.qname))
+            print("Forwarding query for " + str(request.q.qname) + " to upstream server" + str(UPSTREAM_DNS_SERVER) + " ...")
+            upstream_sock.sendto(data, UPSTREAM_DNS_SERVER)
+            response, _ =  upstream_sock.recvfrom(512)
+            socket0.sendto(response, self.client_address)
+            print("Response forwarded to client.")
+
+        """try:
+            request = DNSRecord.parse(data)
+            t_id =  threading.current_thread().ident
+            print(str(t_id) + " received request for: " + str(request.q.qname))
             
             # Create a DNS response with the same ID and the appropriate flags
             reply = DNSRecord(DNSHeader(id=request.header.id, qr=1, aa=1, ra=1), q=request.q)
@@ -92,7 +113,7 @@ class DNSHandler(socketserver.BaseRequestHandler):
             elif not validators.domain(qname[:-1]):
                 raise Exception
             
-            """for server_ip in self.fwdservers:
+            for server_ip in self.fwdservers:
                 print("Querying server " + str(server_ip) + " for " + str(qname0))
                 proto = self.fwdservers[server_ip]
                 t0 = time.time()
@@ -106,7 +127,7 @@ class DNSHandler(socketserver.BaseRequestHandler):
                 if r:
                     print("Received answer from " + str(server_ip) + " in " + str(dtms) + " ms!")
                 else:
-                    print("Received NO answer from " + str(server_ip) + " in " + str(dtms) + " ms!")"""
+                    print("Received NO answer from " + str(server_ip) + " in " + str(dtms) + " ms!")
             
             r = []
             primary = sorted([(t, t.dt, t.server_ip) for t in DNSQUERYTHREADS if t.tier == "primary"],
@@ -153,7 +174,7 @@ class DNSHandler(socketserver.BaseRequestHandler):
             socket.sendto(reply.pack(), self.client_address)
         except Exception as e:
             socket.sendto(reply.pack(), self.client_address)
-            print(f"Error handling request: {e}")
+            print(f"Error handling request: {e}")"""
         
 class ThreadedUDPServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
     pass
@@ -163,25 +184,29 @@ def start():
     #  dig @127.0.0.1 -p 5853 orf.at
     #       or
     # nslookup -port=5853 orf.at localhost
+
+    # tls sockets: https://gist.github.com/marshalhayes/ca9508f97d673b6fb73ba64a67b76ce8
     
     global FWDSERVERS
     global DNSQUERYTHREADS
     FWDSERVERS = {"10.4.0.1": {"proto": "UDP", "tier": "primary"},
                   "10.5.0.1": {"proto": "UDP", "tier": "primary"},
                   "10.128.0.1": {"proto": "UDP", "tier": "primary"},
-                  "8.8.8.8": {"proto": "TLS", "tier": "backup"},
-                  "9.9.9.9": {"proto": "TLS", "tier": "backup"},
-                  "1.1.1.1": {"proto": "TLS", "tier": "backup"}}
-    DNSQUERYTHREADS = []
-    for f in FWDSERVERS:
-        t = DNSQueryThread(f, FWDSERVERS[f]["proto"], FWDSERVERS[f]["tier"], threading.Lock())
-        DNSQUERYTHREADS.append(t)
+                  "8.8.8.8": {"proto": "UDP", "tier": "backup"},
+                  "9.9.9.9": {"proto": "UDP", "tier": "backup"},
+                  "1.1.1.1": {"proto": "UDP", "tier": "backup"}}
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    this_dns_server = ("0.0.0.0", 5853)
+    sock.bind(this_dns_server)
+    print("DNS server started on " + str(this_dns_server))
+
+    while True:
+        data, addr = sock.recvfrom(512)
+        t = threading.Thread(target=handle_query, args=(data, addr, sock, ))
+        t.daemon = True
         t.start()
-   
-    #server1 = socketserver.UDPServer(("0.0.0.0", 5853), DNSHandler)
-    server1 = ThreadedUDPServer(("0.0.0.0", 5853), DNSHandler)
-    print("DNS Server is running...")
-    server1.serve_forever()
+
     #t = threading.Thread(target=server.serve_forever)
     #t.daemon = True  # don't hang on exit
     #t.start()
