@@ -6,7 +6,7 @@ import dns.query
 import dns.rdatatype
 import dns.resolver
 from threading import Thread
-import validators
+import ssl
 import socket
 import socketserver
 from dnslib import DNSRecord, QTYPE, RR, A, DNSHeader
@@ -16,6 +16,8 @@ local_ip = socket.gethostbyname(hostname)
 
 FWDSERVERS = {}
 DNSQUERYTHREADS = []
+
+
 
 
 class DNSQueryThread(Thread):
@@ -67,14 +69,33 @@ class DNSQueryThread(Thread):
                 continue
 
 def handle_query(data, addr, sock):
+    #UPSTREAM_DNS_SERVER = ('1.1.1.1', 53)
+    ## with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as upstream_sock:
+    #    request = DNSRecord.parse(data)
+    #    print(
+    #        "Forwarding query for " + str(request.q.qname) + " to upstream server" + str(UPSTREAM_DNS_SERVER) + " ...")
+    #   upstream_sock.sendto(data, UPSTREAM_DNS_SERVER)
+    #   response, _ = upstream_sock.recvfrom(512)
+    #    sock.sendto(response, addr)
+    # dns over tls geht so:
+    ## https://github.com/melvilgit/dns-over-tls/blob/master/dnsovertls.py
+
     UPSTREAM_DNS_SERVER = ('1.1.1.1', 53)
+    print(DNSRecord.parse(data))
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as upstream_sock:
-        request = DNSRecord.parse(data)
-        print(
-            "Forwarding query for " + str(request.q.qname) + " to upstream server" + str(UPSTREAM_DNS_SERVER) + " ...")
+        print("Forwarding query to upstream server...")
         upstream_sock.sendto(data, UPSTREAM_DNS_SERVER)
         response, _ = upstream_sock.recvfrom(512)
+        print(DNSRecord.parse(response))
         sock.sendto(response, addr)
+        print("Response forwarded to client.")
+
+    """with conn as sock0:
+        sock0.send(data)
+        print("#1")
+        response = sock0.recv(4096)
+    print("#2")
+    sock.sendto(response, addr)"""
 
 class DNSHandler(socketserver.BaseRequestHandler):
         
@@ -92,7 +113,7 @@ class DNSHandler(socketserver.BaseRequestHandler):
             request = DNSRecord.parse(data)
             print("Forwarding query for " + str(request.q.qname) + " to upstream server" + str(UPSTREAM_DNS_SERVER) + " ...")
             upstream_sock.sendto(data, UPSTREAM_DNS_SERVER)
-            response, _ =  upstream_sock.recvfrom(512)
+            response =  upstream_sock.recv(1512)
             socket0.sendto(response, self.client_address)
             print("Response forwarded to client.")
 
@@ -186,10 +207,10 @@ def start():
     # nslookup -port=5853 orf.at localhost
 
     # tls sockets: https://gist.github.com/marshalhayes/ca9508f97d673b6fb73ba64a67b76ce8
-    
+
     global FWDSERVERS
     global DNSQUERYTHREADS
-    FWDSERVERS = {"10.4.0.1": {"proto": "UDP", "tier": "primary"},
+    FWDSERVERS = {"10.4.0.1": {"proto": "UDP", "tier": "primary", "hostname": ""},
                   "10.5.0.1": {"proto": "UDP", "tier": "primary"},
                   "10.128.0.1": {"proto": "UDP", "tier": "primary"},
                   "8.8.8.8": {"proto": "UDP", "tier": "backup"},
@@ -200,9 +221,14 @@ def start():
     this_dns_server = ("0.0.0.0", 5853)
     sock.bind(this_dns_server)
     print("DNS server started on " + str(this_dns_server))
-
+    #CONTEXT = ssl.create_default_context()
+    #CONTEXT = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+    #CONTEXT.load_verify_locations("/home/stephan/CA_ssl/rootCA.pem")
+    #conn = CONTEXT.wrap_socket(socket.socket(socket.AF_INET, socket.SOCK_STREAM), server_hostname="dns.quad9.net")
+    #conn.connect(("9.9.9.9", 853))
+    #print("connected")
     while True:
-        data, addr = sock.recvfrom(512)
+        data, addr = sock.recvfrom(1024)
         t = threading.Thread(target=handle_query, args=(data, addr, sock, ))
         t.daemon = True
         t.start()
