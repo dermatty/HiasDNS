@@ -102,29 +102,33 @@ def nameserver_testthread(testdomains, full_dns_dic, lock, timeout, logger):
                 r = dns.query.udp(testdomain_q0, ip, port=port, timeout=maxtimeout).answer
             except (Exception, ):
                 r = []
-
+            
+            rtt0 = time.time() - t0
+            testlist = [ip for ip in full_dns_dic if full_dns_dic[ip]["rtt"] < 0.0]
             if not r:
                 full_dns_dic[ip]["rtt"] = maxtimeout
             else:
-                full_dns_dic[ip]["rtt"] = full_dns_dic[ip]["rtt"] * 0.5 + (time.time() - t0) * 0.5
-
-            testlist = [ip for ip in full_dns_dic if full_dns_dic[ip]["rtt"] < 0.0]
-            
-            if len(testlist) > 0:
-                to0 = 0.1
-            else:
-                to0 =  maxtimeout
+                if testlist:
+                    full_dns_dic[ip]["rtt"] = rtt0
+                else:
+                    full_dns_dic[ip]["rtt"] = full_dns_dic[ip]["rtt"] * 0.6 + rtt0 * 0.4
             
             dns_sorted = sorted([(dns0, full_dns_dic[dns0]["port"], full_dns_dic[dns0]["proto"],
                                       full_dns_dic[dns0]["rtt"]) for dns0 in full_dns_dic
-                                     if full_dns_dic[dns0]["primary"] and full_dns_dic[dns0]["primary"] < timeout],
+                                     if full_dns_dic[dns0]["primary"] and full_dns_dic[dns0]["primary"] < timeout*0.8],
                                 key=lambda idx: idx[3])
             if not dns_sorted:
                 dns_sorted = sorted([(dns0, full_dns_dic[dns0]["port"], full_dns_dic[dns0]["proto"],
                                       full_dns_dic[dns0]["rtt"]) for dns0 in full_dns_dic
                                      if not full_dns_dic[dns0]["primary"]], key=lambda idx: idx[3])
+            logger.debug(str(dns_sorted))
             with lock:
                 BEST_SERVER = (dns_sorted[0][0], dns_sorted[0][1], dns_sorted[0][2])
+            
+            if len(testlist) > 0:
+                to0 = 0.01
+            else:
+                to0 = maxtimeout
             time.sleep(to0)
     except Exception as e:
         logger.error("ERROR in nameserver_testthread: " + str(e))
@@ -343,7 +347,6 @@ def start():
     logger.info("DNS server started on " + str(this_dns_server))
     while True:
         data, addr = sock.recvfrom(1024)
-        # (data, addr, sock, tlock, logger):
         t = threading.Thread(target=handle_query, args=(data, addr, sock, tlock, logger, ))
         t.daemon = True
         t.start()
