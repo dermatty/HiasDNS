@@ -6,16 +6,23 @@ import dns.query
 import dns.rdatatype
 import dns.resolver
 from threading import Thread
+import random
 import ssl
 import socket
 import socketserver
 from dnslib import DNSRecord, QTYPE, RR, A, DNSHeader
+from os.path import expanduser
+import configparser
+import logging
+import logging.handlers
+import json
+import multiprocessing
+
 
 hostname = socket.gethostname()
 local_ip = socket.gethostbyname(hostname)
 
-FWDSERVERS = {}
-DNSQUERYTHREADS = []
+BEST_SERVER = ('10.4.0.1', 53, 0.0)
 
 
 
@@ -68,34 +75,77 @@ class DNSQueryThread(Thread):
             except (Exception, ):
                 continue
 
-def handle_query(data, addr, sock):
-    #UPSTREAM_DNS_SERVER = ('1.1.1.1', 53)
-    ## with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as upstream_sock:
-    #    request = DNSRecord.parse(data)
-    #    print(
-    #        "Forwarding query for " + str(request.q.qname) + " to upstream server" + str(UPSTREAM_DNS_SERVER) + " ...")
-    #   upstream_sock.sendto(data, UPSTREAM_DNS_SERVER)
-    #   response, _ = upstream_sock.recvfrom(512)
-    #    sock.sendto(response, addr)
+def nameserver_testthread(testdomains, full_dns_dic, lock, timeout, logger):
+    global BEST_SERVER
+    try:
+        maxtimeout = timeout
+        full_dns_list = list(full_dns_dic.items())
+        testdomains_q = []
+        for td0 in testdomains:
+            qname0 = dns.name.from_text(td0)
+            q = dns.message.make_query(qname0, dns.rdatatype.A)
+            testdomains_q.append(q)
+        testdq_len = len(testdomains)
+        
+        while True:
+            testdomain_q0 = testdomains_q[random.randint(0, testdq_len-1)]
+            random_dns = random.choice(full_dns_list)
+            ip = random_dns[0]
+            port = int(random_dns[1]["port"])
+            proto = random_dns[1]["proto"]
+            #print(ip, port, proto)
+            #print(testdomain_q0)
+            
+            t0 = time.time()
+            # if proto.lower() == "udp":
+            try:
+                r = dns.query.udp(testdomain_q0, ip, port=port, timeout=maxtimeout).answer
+            except (Exception, ):
+                r = []
+
+            if not r:
+                full_dns_dic[ip]["rtt"] = maxtimeout
+            else:
+                full_dns_dic[ip]["rtt"] = full_dns_dic[ip]["rtt"] * 0.5 + (time.time() - t0) * 0.5
+
+            testlist = [ip for ip in full_dns_dic if full_dns_dic[ip]["rtt"] < 0.0]
+            
+            if len(testlist) > 0:
+                to0 = 0.1
+            else:
+                to0 =  maxtimeout
+            
+            dns_sorted = sorted([(dns0, full_dns_dic[dns0]["port"], full_dns_dic[dns0]["proto"],
+                                      full_dns_dic[dns0]["rtt"]) for dns0 in full_dns_dic
+                                     if full_dns_dic[dns0]["primary"] and full_dns_dic[dns0]["primary"] < timeout],
+                                key=lambda idx: idx[3])
+            if not dns_sorted:
+                dns_sorted = sorted([(dns0, full_dns_dic[dns0]["port"], full_dns_dic[dns0]["proto"],
+                                      full_dns_dic[dns0]["rtt"]) for dns0 in full_dns_dic
+                                     if not full_dns_dic[dns0]["primary"]], key=lambda idx: idx[3])
+            with lock:
+                BEST_SERVER = (dns_sorted[0][0], dns_sorted[0][1], dns_sorted[0][2])
+            time.sleep(to0)
+    except Exception as e:
+        logger.error("ERROR in nameserver_testthread: " + str(e))
+        
+
+def handle_query(data, addr, sock, tlock, logger):
+    global BEST_SERVER
+
     # dns over tls geht so:
     ## https://github.com/melvilgit/dns-over-tls/blob/master/dnsovertls.py
 
-    UPSTREAM_DNS_SERVER = ('1.1.1.1', 53)
-    print(DNSRecord.parse(data))
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as upstream_sock:
-        print("Forwarding query to upstream server...")
-        upstream_sock.sendto(data, UPSTREAM_DNS_SERVER)
-        response, _ = upstream_sock.recvfrom(512)
-        print(DNSRecord.parse(response))
-        sock.sendto(response, addr)
-        print("Response forwarded to client.")
-
-    """with conn as sock0:
-        sock0.send(data)
-        print("#1")
-        response = sock0.recv(4096)
-    print("#2")
-    sock.sendto(response, addr)"""
+        with tlock:
+            server, port, _ = BEST_SERVER #get_best_upstream_dns(primary_dns, backup_dns, full_dns_dic, tlock)
+        logger.debug("forwarding to " + str(server) + ":" + str(port))
+        try:
+            upstream_sock.sendto(data, (server, port))
+            response, _ = upstream_sock.recvfrom(512)
+            sock.sendto(response, addr)
+        except (Exception, ):
+            pass
 
 class DNSHandler(socketserver.BaseRequestHandler):
         
@@ -115,7 +165,7 @@ class DNSHandler(socketserver.BaseRequestHandler):
             upstream_sock.sendto(data, UPSTREAM_DNS_SERVER)
             response =  upstream_sock.recv(1512)
             socket0.sendto(response, self.client_address)
-            print("Response forwarded to client.")
+            print("_" * 80)
 
         """try:
             request = DNSRecord.parse(data)
@@ -201,37 +251,112 @@ class ThreadedUDPServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
     pass
 
 def start():
+    global BEST_SERVER
     # on client side:
     #  dig @127.0.0.1 -p 5853 orf.at
     #       or
     # nslookup -port=5853 orf.at localhost
 
     # tls sockets: https://gist.github.com/marshalhayes/ca9508f97d673b6fb73ba64a67b76ce8
-
-    global FWDSERVERS
-    global DNSQUERYTHREADS
-    FWDSERVERS = {"10.4.0.1": {"proto": "UDP", "tier": "primary", "hostname": ""},
-                  "10.5.0.1": {"proto": "UDP", "tier": "primary"},
-                  "10.128.0.1": {"proto": "UDP", "tier": "primary"},
-                  "8.8.8.8": {"proto": "UDP", "tier": "backup"},
-                  "9.9.9.9": {"proto": "UDP", "tier": "backup"},
-                  "1.1.1.1": {"proto": "UDP", "tier": "backup"}}
+    
+    userhome = expanduser("~")
+    maindir = userhome + "/.hiasdns/"
+    
+    # Init Logger
+    logger = logging.getLogger("hdns")
+    logger.setLevel(logging.DEBUG)
+    fh = logging.FileHandler(maindir + "hiasdns.log", mode="w")
+    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+    
+    # read config
+    cfg_file = maindir + "config"
+    try:
+        cfg = configparser.ConfigParser()
+        cfg.read(cfg_file)
+        
+        bindaddress = str(cfg["GENERAL"]["bindaddress"])
+        listenport = int(cfg["GENERAL"]["listenport"])
+        assert 1024 < listenport <= 65535
+        logger.info("Set bindaddress, port to: (" + bindaddress + ", " + str(listenport) + ")")
+        
+        testdomains = json.loads(cfg["GENERAL"]["testdomains"])
+        logger.info("Set testdomains to : " + str(testdomains))
+        
+        i = 1
+        primary_dns = {}
+        while True:
+            try:
+                ip0 = str(cfg["PRIMARYDNS" + str(i)]["ip"])
+                port0 = int(cfg["PRIMARYDNS" + str(i)]["port"])
+                assert 1024 < listenport <= 65535
+                proto0 = str(cfg["PRIMARYDNS" + str(i)]["proto"])
+            except (Exception, ):
+                break
+            primary_dns[ip0] = {"port": port0, "proto": proto0, "rtt": -1.0, "primary": True}
+            i += 1
+        if i==1:
+            logger.error("Config ERROR: no primary nameservers given, exiting ...")
+        logger.info("Set primary nameservers to : " + str(primary_dns))
+        i = 1
+        backup_dns = {}
+        while True:
+            try:
+                ip0 = str(cfg["BACKUPDNS" + str(i)]["ip"])
+                port0 = int(cfg["BACKUPDNS" + str(i)]["port"])
+                assert 1024 < listenport <= 65535
+                proto0 = str(cfg["BACKUPDNS" + str(i)]["proto"])
+            except (Exception,):
+                break
+            backup_dns[ip0] = {"port": port0, "proto": proto0, "rtt": -1.0, "primary": False}
+            i += 1
+    except Exception as e:
+        logger.error(str(e) + ", exiting ...")
+        sys.exit()
+    logger.info("Set backup nameservers to : " + str(backup_dns))
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    this_dns_server = ("0.0.0.0", 5853)
+    this_dns_server = (bindaddress, listenport)
     sock.bind(this_dns_server)
+    
+    MAXTIMEOUT = 5.0
+    
+    # start MP process for testing nameservers on testdomains
+    full_dns_dic = primary_dns | backup_dns
+    tlock = threading.Lock()
+    ntt = threading.Thread(target=nameserver_testthread, args=(testdomains, full_dns_dic, tlock, MAXTIMEOUT, logger))
+    ntt.daemon = True
+    ntt.start()
+    logger.debug("Started + initializing testthread ...")
+    t0 = time.time()
+    while True:
+        with tlock:
+            if len([ip for ip in full_dns_dic if full_dns_dic[ip]["rtt"] < 0.0]) == 0:
+                break
+        time.sleep(0.1)
+    logger.debug("Testthread initialized after " + str(round(time.time() - t0, 2)) + " sec!")
+    logger.debug("Full nameserver dict. is: " + str(full_dns_dic))
+    
+    # start main Thread
     print("DNS server started on " + str(this_dns_server))
-    #CONTEXT = ssl.create_default_context()
-    #CONTEXT = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
-    #CONTEXT.load_verify_locations("/home/stephan/CA_ssl/rootCA.pem")
-    #conn = CONTEXT.wrap_socket(socket.socket(socket.AF_INET, socket.SOCK_STREAM), server_hostname="dns.quad9.net")
-    #conn.connect(("9.9.9.9", 853))
-    #print("connected")
+    logger.info("DNS server started on " + str(this_dns_server))
     while True:
         data, addr = sock.recvfrom(1024)
-        t = threading.Thread(target=handle_query, args=(data, addr, sock, ))
+        # (data, addr, sock, tlock, logger):
+        t = threading.Thread(target=handle_query, args=(data, addr, sock, tlock, logger, ))
         t.daemon = True
         t.start()
+
+
+
+    
+    # CONTEXT = ssl.create_default_context()
+    # CONTEXT = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+    # CONTEXT.load_verify_locations("/home/stephan/CA_ssl/rootCA.pem")
+    # conn = CONTEXT.wrap_socket(socket.socket(socket.AF_INET, socket.SOCK_STREAM), server_hostname="dns.quad9.net")
+    # conn.connect(("9.9.9.9", 853))
+    # print("connected")
 
     #t = threading.Thread(target=server.serve_forever)
     #t.daemon = True  # don't hang on exit
