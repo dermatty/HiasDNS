@@ -299,6 +299,7 @@ async def asyncio_main(this_dns_server):
     finally:
         transport.close()
 
+# Idee: zum besten nicht besetzten primary server forwarden
 def start():
     global BEST_SERVER
     # on client side:
