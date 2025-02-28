@@ -7,6 +7,7 @@ import dns.rdatatype
 import dns.resolver
 from threading import Thread
 import random
+import asyncio
 import ssl
 import socket
 import socketserver
@@ -160,12 +161,28 @@ def handle_query(data, addr, sock, logger):
         except (Exception, ):
             pass
 
-class EchoServer(DatagramServer):
+#gevent
+class GeventDNSServer(DatagramServer):
     def setparams(self, logger):
         self.logger = logger
 
     def handle(self, data, address): # pylint:disable=method-hidden
         handle_query(data, address, self.socket, self.logger)
+
+#asyncio
+class AsyncioDNSServerProtocol:
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, data, addr):
+        server, port, _ = BEST_SERVER
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as upstream_sock:
+            upstream_sock.sendto(data, (server, port))
+            response, _ = upstream_sock.recvfrom(512)
+        #print(DNSRecord.parse(response))
+        self.transport.sendto(response, addr)
+
 
 
 class DNSHandler(socketserver.BaseRequestHandler):
@@ -271,6 +288,17 @@ class DNSHandler(socketserver.BaseRequestHandler):
 class ThreadedUDPServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
     pass
 
+async def asyncio_main(this_dns_server):
+    loop = asyncio.get_running_loop()
+
+    transport, protocol = await loop.create_datagram_endpoint(AsyncioDNSServerProtocol,
+        local_addr=this_dns_server)
+    try:
+        while True:
+            await asyncio.sleep(3600)  # Serve for 1 hour.
+    finally:
+        transport.close()
+
 def start():
     global BEST_SERVER
     # on client side:
@@ -280,9 +308,6 @@ def start():
 
     # tls sockets: https://gist.github.com/marshalhayes/ca9508f97d673b6fb73ba64a67b76ce8
 
-
-
-    
     userhome = expanduser("~")
     maindir = userhome + "/.hiasdns/"
     
@@ -298,7 +323,7 @@ def start():
     # set threading mode, default is python threading module
     try:
         tmode = sys.argv[1]
-        if tmode.lower() not in ["gevent", "threading"]:
+        if tmode.lower() not in ["gevent", "threading", "asyncio"]:
             tmode = "threading"
     except (Exception,):
         tmode = "threading"
@@ -378,9 +403,12 @@ def start():
 
     if tmode == "gevent":
         logger.info("DNS gevent server started on " + str(this_dns_server))
-        es = EchoServer(this_dns_server_str)
+        es = GeventDNSServer(this_dns_server_str)
         es.setparams(logger)
         es.serve_forever()
+    elif tmode == "asyncio":
+        logger.info("DNS asyncio server started on " + str(this_dns_server))
+        asyncio.run(asyncio_main(this_dns_server))
     else:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.bind(this_dns_server)
