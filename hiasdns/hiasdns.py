@@ -10,19 +10,26 @@ import random
 import ssl
 import socket
 import socketserver
+
+import gevent.lock
 from dnslib import DNSRecord, QTYPE, RR, A, DNSHeader
 from os.path import expanduser
 import configparser
 import logging
 import logging.handlers
 import json
-import multiprocessing
-
+from gevent.server import DatagramServer
 
 hostname = socket.gethostname()
 local_ip = socket.gethostbyname(hostname)
 
 BEST_SERVER = ('10.4.0.1', 53, 0.0)
+
+
+
+
+
+
 
 
 
@@ -134,22 +141,32 @@ def nameserver_testthread(testdomains, full_dns_dic, lock, timeout, logger):
         logger.error("ERROR in nameserver_testthread: " + str(e))
         
 
-def handle_query(data, addr, sock, tlock, logger):
+def handle_query(data, addr, sock, logger):
     global BEST_SERVER
 
     # dns over tls geht so:
     ## https://github.com/melvilgit/dns-over-tls/blob/master/dnsovertls.py
 
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as upstream_sock:
-        with tlock:
-            server, port, _ = BEST_SERVER #get_best_upstream_dns(primary_dns, backup_dns, full_dns_dic, tlock)
+        # with tlock:
+        server, port, _ = BEST_SERVER #get_best_upstream_dns(primary_dns, backup_dns, full_dns_dic, tlock)
         logger.debug("forwarding to " + str(server) + ":" + str(port))
         try:
             upstream_sock.sendto(data, (server, port))
             response, _ = upstream_sock.recvfrom(512)
+            #request = str(DNSRecord.parse(response)).split(";;")
+            #print(request)
             sock.sendto(response, addr)
         except (Exception, ):
             pass
+
+class EchoServer(DatagramServer):
+    def setparams(self, logger):
+        self.logger = logger
+
+    def handle(self, data, address): # pylint:disable=method-hidden
+        handle_query(data, address, self.socket, self.logger)
+
 
 class DNSHandler(socketserver.BaseRequestHandler):
         
@@ -262,6 +279,9 @@ def start():
     # nslookup -port=5853 orf.at localhost
 
     # tls sockets: https://gist.github.com/marshalhayes/ca9508f97d673b6fb73ba64a67b76ce8
+
+
+
     
     userhome = expanduser("~")
     maindir = userhome + "/.hiasdns/"
@@ -273,6 +293,16 @@ def start():
     formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
     fh.setFormatter(formatter)
     logger.addHandler(fh)
+
+    logger.info("-" * 80)
+    # set threading mode, default is python threading module
+    try:
+        tmode = sys.argv[1]
+        if tmode.lower() not in ["gevent", "threading"]:
+            tmode = "threading"
+    except (Exception,):
+        tmode = "threading"
+    logger.debug("Set threading mode to " + tmode)
     
     # read config
     cfg_file = maindir + "config"
@@ -320,9 +350,7 @@ def start():
         sys.exit()
     logger.info("Set backup nameservers to : " + str(backup_dns))
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    this_dns_server = (bindaddress, listenport)
-    sock.bind(this_dns_server)
+
     
     MAXTIMEOUT = 5.0
     
@@ -341,15 +369,33 @@ def start():
         time.sleep(0.1)
     logger.debug("Testthread initialized after " + str(round(time.time() - t0, 2)) + " sec!")
     logger.debug("Full nameserver dict. is: " + str(full_dns_dic))
+
     
     # start main Thread
-    print("DNS server started on " + str(this_dns_server))
-    logger.info("DNS server started on " + str(this_dns_server))
-    while True:
-        data, addr = sock.recvfrom(1024)
-        t = threading.Thread(target=handle_query, args=(data, addr, sock, tlock, logger, ))
-        t.daemon = True
-        t.start()
+
+    this_dns_server = (bindaddress, listenport)
+    this_dns_server_str = bindaddress + ":" + str(listenport)
+
+    if tmode == "gevent":
+        logger.info("DNS gevent server started on " + str(this_dns_server))
+        es = EchoServer(this_dns_server_str)
+        es.setparams(logger)
+        es.serve_forever()
+    else:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(this_dns_server)
+        logger.info("DNS threading server started on " + str(this_dns_server))
+        while True:
+            data, addr = sock.recvfrom(1024)
+            t = threading.Thread(target=handle_query, args=(data, addr, sock, logger,))
+            t.daemon = True
+            t.start()
+
+
+
+
+
+
 
 
 
