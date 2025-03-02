@@ -19,21 +19,15 @@ import configparser
 import logging
 import logging.handlers
 import json
+import gevent
 from gevent.server import DatagramServer
 
 hostname = socket.gethostname()
 local_ip = socket.gethostbyname(hostname)
 
 BEST_SERVER = ('10.4.0.1', 53, 0.0)
-
-
-
-
-
-
-
-
-
+SERVERLIST = []
+SEMA = threading.Semaphore()
 
 class DNSQueryThread(Thread):
     def __init__(self, server_ip, proto, tier, lock):
@@ -85,6 +79,8 @@ class DNSQueryThread(Thread):
 
 def nameserver_testthread(testdomains, full_dns_dic, lock, timeout, logger):
     global BEST_SERVER
+    global SEMA
+    global SERVERLIST
     try:
         maxtimeout = timeout
         full_dns_list = list(full_dns_dic.items())
@@ -120,15 +116,17 @@ def nameserver_testthread(testdomains, full_dns_dic, lock, timeout, logger):
                     full_dns_dic[ip]["rtt"] = rtt0
                 else:
                     full_dns_dic[ip]["rtt"] = full_dns_dic[ip]["rtt"] * 0.6 + rtt0 * 0.4
-            
-            dns_sorted = sorted([(dns0, full_dns_dic[dns0]["port"], full_dns_dic[dns0]["proto"],
-                                      full_dns_dic[dns0]["rtt"]) for dns0 in full_dns_dic
-                                     if full_dns_dic[dns0]["primary"] and full_dns_dic[dns0]["primary"] < timeout*0.8],
-                                key=lambda idx: idx[3])
-            if not dns_sorted:
+            with SEMA:
                 dns_sorted = sorted([(dns0, full_dns_dic[dns0]["port"], full_dns_dic[dns0]["proto"],
-                                      full_dns_dic[dns0]["rtt"]) for dns0 in full_dns_dic
-                                     if not full_dns_dic[dns0]["primary"]], key=lambda idx: idx[3])
+                                          full_dns_dic[dns0]["rtt"]) for dns0 in full_dns_dic
+                                         if full_dns_dic[dns0]["primary"] and full_dns_dic[dns0]["primary"] < timeout*0.8
+                                     and full_dns_dic[dns0] not in SERVERLIST],
+                                    key=lambda idx: idx[3])
+            if not dns_sorted:
+                with SEMA:
+                    dns_sorted = sorted([(dns0, full_dns_dic[dns0]["port"], full_dns_dic[dns0]["proto"],
+                                          full_dns_dic[dns0]["rtt"]) for dns0 in full_dns_dic
+                                         if not full_dns_dic[dns0]["primary"]], key=lambda idx: idx[3])
             logger.debug(str(dns_sorted))
             with lock:
                 BEST_SERVER = (dns_sorted[0][0], dns_sorted[0][1], dns_sorted[0][2])
@@ -144,6 +142,7 @@ def nameserver_testthread(testdomains, full_dns_dic, lock, timeout, logger):
 
 def handle_query(data, addr, sock, logger):
     global BEST_SERVER
+    global SERVERLIST
 
     # dns over tls geht so:
     ## https://github.com/melvilgit/dns-over-tls/blob/master/dnsovertls.py
@@ -302,6 +301,7 @@ async def asyncio_main(this_dns_server):
 # Idee: zum besten nicht besetzten primary server forwarden
 def start():
     global BEST_SERVER
+    global SEMA
     # on client side:
     #  dig @127.0.0.1 -p 5853 orf.at
     #       or
@@ -329,6 +329,12 @@ def start():
     except (Exception,):
         tmode = "threading"
     logger.debug("Set threading mode to " + tmode)
+    if tmode.lower() == "threading":
+        SEMA = threading.Semaphore()
+    elif tmode.lower() == "gevent":
+        SEMA = gevent.lock.Semaphore()
+    else:
+        SEMA = asyncio.Semaphore()
     
     # read config
     cfg_file = maindir + "config"
